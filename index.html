@@ -411,9 +411,9 @@
     <p class="hint">Escolha a linha e o horário de saída - o trajeto da extensão/variante certa carrega automaticamente.</p>
 
     <div class="field maptiler-key-field">
-      <label>Chave MapTiler (p/ navegação 3D)</label>
-      <input type="text" id="maptilerKeyInput" placeholder="Cole sua chave aqui">
-      <p class="stop-hint">Grátis em <a href="https://cloud.maptiler.com/account/keys/" target="_blank" rel="noopener">cloud.maptiler.com</a> → Keys → copiar e colar aqui. Fica salva só neste navegador.</p>
+      <label>Chave MapTiler incorporada</label>
+      <input type="password" id="maptilerKeyInput" value="" readonly autocomplete="off" aria-label="Chave MapTiler configurada no código">
+      <p class="stop-hint">A chave já está configurada nesta versão. Restrinja-a ao domínio publicado no painel MapTiler; ela pode ser vista no código-fonte do HTML.</p>
     </div>
 
     <div class="row2">
@@ -439,7 +439,7 @@
         <p class="stop-hint" id="driverActiveMeta"></p>
       </div>
       <p class="stop-hint" id="driverGpsStatus"></p>
-      <div id="driverRouteWarning" class="status-msg warn" hidden></div>
+      <div id="driverRouteWarning" class="status-msg warn" role="alert" aria-live="assertive" hidden></div>
       <label class="kml-toggle"><input type="checkbox" id="driverFollowToggle" checked> seguir minha posição no mapa</label>
       <label class="kml-toggle"><input type="checkbox" id="driver3dToggle" checked> navegação 3D <span class="estimate-note">(precisa da chave MapTiler acima)</span></label>
       <button class="btn-secondary" id="driverSimulateBtn" type="button" style="width:100%">Simular percurso (sem GPS real)</button>
@@ -953,12 +953,41 @@
     }
   });
 
+  // Os controles ficam fora das instâncias de mapa; encaminhe cada ação ao mapa que está visível.
+  function visibleDriverMap3d(){
+    return !document.getElementById('driverMap3d').hidden && !!map3d;
+  }
+
   function fitToNetwork(){
+    if (!document.getElementById('driverPanelBody').hidden && driverActiveTrip){
+      const pts = shapes[driverActiveTrip.shapeId] || [];
+      if (pts.length){
+        if (visibleDriverMap3d()){
+          const lons = pts.map(p => p[1]), lats = pts.map(p => p[0]);
+          map3d.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]],
+            { padding:56, pitch:62, duration:500 });
+        } else {
+          map.fitBounds(L.latLngBounds(pts), { padding:[36,36] });
+        }
+        return;
+      }
+    }
     map.fitBounds(networkBounds, { padding:[24,24] });
   }
 
-  document.getElementById('zoomIn').addEventListener('click', () => map.zoomIn());
-  document.getElementById('zoomOut').addEventListener('click', () => map.zoomOut());
+  function zoomVisibleMap(direction){
+    if (visibleDriverMap3d()){
+      if (direction > 0) map3d.zoomIn({ duration:250 });
+      else map3d.zoomOut({ duration:250 });
+    } else if (direction > 0){
+      map.zoomIn();
+    } else {
+      map.zoomOut();
+    }
+  }
+
+  document.getElementById('zoomIn').addEventListener('click', () => zoomVisibleMap(1));
+  document.getElementById('zoomOut').addEventListener('click', () => zoomVisibleMap(-1));
   document.getElementById('zoomFit').addEventListener('click', fitToNetwork);
 
   function handleMapClick(lat, lon){
@@ -2010,15 +2039,37 @@
   }
 
   // ---------------- real 3D nav camera (MapLibre GL, driver mode only) ----------------
-  const MAPTILER_KEY_STORAGE = 'foztrans_maptiler_key';
+  // Chave de cliente fornecida pelo operador. Chaves incluídas em HTML são públicas: restrinja o domínio e a cota no provedor.
+  const EMBEDDED_MAPTILER_KEY = '8Zh9UBxiKf2BpwWOJuCN';
   const maptilerKeyInput = document.getElementById('maptilerKeyInput');
-  maptilerKeyInput.value = localStorage.getItem(MAPTILER_KEY_STORAGE) || '';
-  maptilerKeyInput.addEventListener('change', () => {
-    try { localStorage.setItem(MAPTILER_KEY_STORAGE, maptilerKeyInput.value.trim()); } catch(e){}
-  });
-  function getMaptilerKey(){ return maptilerKeyInput.value.trim(); }
+  maptilerKeyInput.value = EMBEDDED_MAPTILER_KEY;
+  function getMaptilerKey(){ return EMBEDDED_MAPTILER_KEY.trim(); }
 
   let map3d = null, map3dMarker = null, map3dFailed = false;
+
+  // Aumenta a profundidade da cena quando o estilo não trouxer prédios extrudados por padrão.
+  function add3DBuildings(m3){
+    if (!m3 || !m3.isStyleLoaded() || m3.getLayer('foztrans-3d-buildings')) return;
+    const style = m3.getStyle();
+    if ((style.layers||[]).some(layer => layer.type === 'fill-extrusion')) return;
+    const building = (style.layers||[]).find(layer => layer['source-layer'] === 'building' && layer.source);
+    if (!building) return;
+    const firstSymbol = (style.layers||[]).find(layer => layer.type === 'symbol');
+    try {
+      m3.addLayer({
+        id:'foztrans-3d-buildings', type:'fill-extrusion', source:building.source,
+        'source-layer':building['source-layer'], minzoom:15,
+        paint:{
+          'fill-extrusion-color':'#92a2b1',
+          'fill-extrusion-height':['coalesce',['get','render_height'],['get','height'],0],
+          'fill-extrusion-base':['coalesce',['get','render_min_height'],['get','min_height'],0],
+          'fill-extrusion-opacity':0.76,
+          'fill-extrusion-vertical-gradient':true
+        }
+      }, firstSymbol && firstSymbol.id);
+    } catch(e){ /* o estilo ou provedor pode não oferecer a camada de edifícios */ }
+  }
+
   function ensureMap3d(){
     if (map3d || map3dFailed) return map3d;
     const key = getMaptilerKey();
@@ -2027,14 +2078,13 @@
       map3d = new maplibregl.Map({
         container: 'driverMap3d',
         style: 'https://api.maptiler.com/maps/streets-v2/style.json?key=' + encodeURIComponent(key),
-        center: [-54.5877, -25.5163], pitch: 62, bearing: 0, zoom: 16, antialias: true, attributionControl: true
+        center: [-54.5877, -25.5163], pitch: 68, bearing: 0, zoom: 16, antialias: true, attributionControl: true
       });
       map3d.on('error', (e) => {
-        // a bad/expired key or network issue surfaces here (MapLibre logs to an event, not a thrown
-        // exception) - report it plainly instead of silently sitting on a blank/broken map
         const gpsStatus = document.getElementById('driverGpsStatus');
-        if (gpsStatus) gpsStatus.textContent = 'Erro no mapa 3D (verifique a chave MapTiler): ' + ((e && e.error && e.error.message) || 'falha desconhecida');
+        if (gpsStatus) gpsStatus.textContent = 'Erro no mapa 3D (verifique a chave/restrição de domínio): ' + ((e && e.error && e.error.message) || 'falha desconhecida');
       });
+      map3d.on('load', () => add3DBuildings(map3d));
     } catch(e){
       map3dFailed = true;
       return null;
@@ -2160,13 +2210,13 @@
   // own map instance, reused for the flat preview/fallback) and the MapLibre one are mutually
   // exclusive, never both visible, so there's never a question of which is "the real" position
   function syncMapVisibility(){
-    const using3d = isUsing3d();
+    let using3d = isUsing3d();
+    const m3 = using3d ? ensureMap3d() : null;
+    // Se a instância não puder ser criada, não esconda o mapa 2D: ele é o fallback utilizável.
+    if (using3d && !m3) using3d = false;
     document.getElementById('leafletMap').hidden = using3d;
     document.getElementById('driverMap3d').hidden = !using3d;
-    if (using3d){
-      const m3 = ensureMap3d();
-      if (m3) setTimeout(() => m3.resize(), 0); // container just became visible - it had 0 size before
-    }
+    if (using3d) setTimeout(() => m3.resize(), 0); // o contêiner tinha tamanho zero enquanto oculto
   }
 
   function drawRouteOnMap3d(shapePts, tripId){
@@ -2191,7 +2241,7 @@
           paint: { 'circle-radius':4, 'circle-color': getComputedColor('--accent2'), 'circle-stroke-width':1.5, 'circle-stroke-color': getComputedColor('--surface') } });
       }
       const lons = shapePts.map(p=>p[1]), lats = shapePts.map(p=>p[0]);
-      if (lons.length) m3.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]], { padding:48, pitch:62 });
+      if (lons.length) m3.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]], { padding:48, pitch:68 });
       // the vehicle marker itself is created lazily by updateDriverMarker on the first real
       // position fix (GPS or simulation) - not here, so there's one single place that owns it
     };
@@ -2210,9 +2260,11 @@
     if (driverWatchId != null){ navigator.geolocation.clearWatch(driverWatchId); driverWatchId = null; }
     if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
     driverMarker = null;
-    map3dMarker = null;
+    if (map3dMarker){ map3dMarker.remove(); map3dMarker = null; }
     driverLastLatLng = null;
     driverBearing = 0;
+    driverOffRouteSince = null;
+    driverOffRouteActive = false;
 
     driverActiveTrip = cand;
     const route = routes[cand.routeId];
@@ -2248,34 +2300,105 @@
     startRealGps();
   }
 
-  // "um raio considerável" - a driver a couple dozen meters off a shape's straight-line simplification
-  // is normal (lane position, GPS noise, a real curve the shape simplified), so the threshold is set
-  // well above that: only a genuine wrong-turn-scale deviation should trigger the warning
-  const ROUTE_DEVIATION_THRESHOLD_M = 150;
+  // Alerta só após sair do corredor por tempo suficiente. A faixa de retorno é menor (histerese)
+  // para evitar que o aviso fique piscando perto do limite. A precisão informada pelo GPS é considerada.
+  const ROUTE_DEVIATION_THRESHOLD_M = 120;
+  const ROUTE_RECOVERY_THRESHOLD_M = 75;
+  const ROUTE_DEVIATION_CONFIRM_MS = 8000;
+  const GPS_ALERT_MAX_ACCURACY_M = 60;
+  let driverOffRouteSince = null;
+  let driverOffRouteActive = false;
+
+  // Distância perpendicular em uma projeção local em metros, adequada para segmentos curtos da linha.
+  // A consulta é contra cada segmento do shape, não apenas contra os vértices, evitando falsos alertas
+  // em trechos com pontos GTFS mais espaçados.
+  function pointToRouteSegmentMeters(lat, lon, a, b){
+    const R = 6371000, rad = Math.PI/180, cosLat = Math.cos(lat*rad);
+    const ax = (a[1]-lon)*rad*R*cosLat, ay = (a[0]-lat)*rad*R;
+    const bx = (b[1]-lon)*rad*R*cosLat, by = (b[0]-lat)*rad*R;
+    const dx = bx-ax, dy = by-ay, length2 = dx*dx+dy*dy;
+    const t = length2 ? Math.max(0,Math.min(1,-(ax*dx+ay*dy)/length2)) : 0;
+    return Math.hypot(ax+t*dx, ay+t*dy);
+  }
 
   function driverDistanceToRoute(lat, lon){
     if (!driverActiveTrip) return null;
     const pts = shapes[driverActiveTrip.shapeId];
     if (!pts || !pts.length) return null;
+    if (pts.length === 1) return haversine(lat, lon, pts[0][0], pts[0][1]);
     let best = Infinity;
-    for (let i=0;i<pts.length;i++){
-      const d = haversine(lat, lon, pts[i][0], pts[i][1]);
+    for (let i=0;i<pts.length-1;i++){
+      const d = pointToRouteSegmentMeters(lat, lon, pts[i], pts[i+1]);
       if (d<best) best = d;
     }
     return best;
   }
 
+  function updateRouteDeviation(distanceMeters, accuracyMeters){
+    const warnEl = document.getElementById('driverRouteWarning');
+    const gpsStatus = document.getElementById('driverGpsStatus');
+    if (distanceMeters == null || !Number.isFinite(distanceMeters)){
+      driverOffRouteSince = null;
+      driverOffRouteActive = false;
+      warnEl.hidden = true;
+      return false;
+    }
+
+    const accuracy = Number.isFinite(accuracyMeters) ? Math.max(0,accuracyMeters) : 0;
+    if (accuracy > GPS_ALERT_MAX_ACCURACY_M){
+      // GPS pouco confiável não deve iniciar um novo alerta. Se o alerta já estiver ativo, mantenha-o
+      // visível até haver uma leitura boa que confirme o retorno à rota.
+      driverOffRouteSince = null;
+      if (!driverOffRouteActive){
+        warnEl.hidden = true;
+        gpsStatus.textContent = 'GPS com precisão baixa (±' + fmtDist(accuracy) + '); alerta de desvio aguardando sinal melhor.';
+      } else {
+        warnEl.hidden = false; // mantenha o alerta já confirmado, sem sobrescrevê-lo a cada leitura
+        gpsStatus.textContent = 'GPS com precisão baixa (±' + fmtDist(accuracy) + '); verificando o retorno à rota.';
+      }
+      return driverOffRouteActive;
+    }
+
+    const distanceBeyondAccuracy = Math.max(0,distanceMeters-accuracy);
+    const now = Date.now();
+    if (distanceBeyondAccuracy >= ROUTE_DEVIATION_THRESHOLD_M){
+      if (driverOffRouteSince == null) driverOffRouteSince = now;
+      if (now-driverOffRouteSince >= ROUTE_DEVIATION_CONFIRM_MS) driverOffRouteActive = true;
+    } else if (distanceBeyondAccuracy <= ROUTE_RECOVERY_THRESHOLD_M){
+      driverOffRouteSince = null;
+      driverOffRouteActive = false;
+    } else if (!driverOffRouteActive){
+      // Na faixa intermediária, não acumule tempo para disparo; evite oscilações junto ao limite.
+      driverOffRouteSince = null;
+    }
+
+    if (driverOffRouteActive){
+      warnEl.hidden = false;
+      warnEl.textContent = '⚠ desvio confirmado: a posição permaneceu fora da rota por pelo menos 8 segundos. Verifique a situação e retorne ao itinerário definido.';
+    } else {
+      warnEl.hidden = true;
+    }
+    return driverOffRouteActive;
+  }
+
   // simple top-down bus glyph (not an emoji, to match this app's existing icon style elsewhere) -
   // oriented pointing "up" by default, which is correct exactly because the map itself rotates to
   // keep the direction of travel pointing up (see driverBearing) - the icon never rotates on its own
-  const BUS_ICON_PX = 52; // reference nav apps (Uber/Google) use a large, hard-to-miss vehicle glyph
+  const BUS_ICON_PX = 60;
   function busIconHtml(offRoute){
     const color = offRoute ? 'var(--dest)' : 'var(--accent)';
-    return '<svg width="' + BUS_ICON_PX + '" height="' + BUS_ICON_PX + '" viewBox="0 0 30 30" style="filter:drop-shadow(0 2px 4px rgba(0,0,0,.45))">' +
-      '<rect x="9" y="4" width="12" height="22" rx="4" fill="' + color + '" stroke="var(--surface)" stroke-width="2.2"/>' +
-      '<rect x="11.5" y="7.5" width="7" height="4.5" rx="1" fill="var(--surface)" opacity="0.9"/>' +
-      '<rect x="11" y="14" width="2.6" height="8" rx="0.8" fill="var(--surface)" opacity="0.55"/>' +
-      '<rect x="16.4" y="14" width="2.6" height="8" rx="0.8" fill="var(--surface)" opacity="0.55"/>' +
+    return '<svg width="' + BUS_ICON_PX + '" height="' + BUS_ICON_PX + '" viewBox="0 0 64 64" aria-label="Ônibus" style="overflow:visible;filter:drop-shadow(0 3px 4px rgba(0,0,0,.48))">' +
+      '<defs><linearGradient id="bus-body-gradient" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="' + color + '"/><stop offset="1" stop-color="#172638"/></linearGradient><linearGradient id="bus-glass-gradient" x1="0" y1="0" x2="0.8" y2="1"><stop offset="0" stop-color="#e8f6ff"/><stop offset="1" stop-color="#6d91aa"/></linearGradient></defs>' +
+      '<ellipse cx="33" cy="49" rx="19" ry="7" fill="#07111b" opacity=".34"/>' +
+      '<path d="M42 12 48 16 Q50 17 50 21 L50 42 Q50 45 46 47 L41 49Z" fill="#142331" stroke="var(--surface)" stroke-width="1.5"/>' +
+      '<path d="M18 18 Q18 12 24 10 L36 7 Q42 6 44 12 L44 40 Q44 44 39 47 L27 52 Q21 53 18 47Z" fill="url(#bus-body-gradient)" stroke="var(--surface)" stroke-width="2"/>' +
+      '<path d="M22 17 Q22 13 26 12 L36 10 Q40 10 40 14 L40 22 L22 25Z" fill="url(#bus-glass-gradient)" stroke="#f4f8fb" stroke-width="1.2"/>' +
+      '<path d="M22 28 40 25 40 31 22 35Z" fill="#d9e7ef" opacity=".9"/>' +
+      '<path d="M22 37 40 33 40 39 Q40 42 37 44 L26 48 Q22 49 22 45Z" fill="#a9c0cf" opacity=".86"/>' +
+      '<path d="M25 14 35 12" stroke="#fff" stroke-width="1.4" opacity=".8"/>' +
+      '<circle cx="19" cy="22" r="3.1" fill="#17212a" stroke="#c8d2da" stroke-width="1"/><circle cx="19" cy="40" r="3.1" fill="#17212a" stroke="#c8d2da" stroke-width="1"/>' +
+      '<circle cx="47" cy="22" r="3.1" fill="#17212a" stroke="#c8d2da" stroke-width="1"/><circle cx="47" cy="40" r="3.1" fill="#17212a" stroke="#c8d2da" stroke-width="1"/>' +
+      '<path d="M26 9 28 5 M37 7 39 4" stroke="#fff4c2" stroke-width="2" stroke-linecap="round"/>' +
     '</svg>';
   }
   function driverMarkerIcon(offRoute){
@@ -2287,7 +2410,7 @@
     driverMarker.setIcon(driverMarkerIcon(offRoute));
   }
 
-  function updateDriverMarker(lat, lon){
+  function updateDriverMarker(lat, lon, accuracyMeters=0){
     // heading only makes sense once there's a previous fix to compare against - the very first
     // update of a session keeps whatever bearing (0/north) was last set, rather than guessing
     if (driverLastLatLng){
@@ -2297,14 +2420,7 @@
     driverLastLatLng = { lat, lon };
 
     const dist = driverDistanceToRoute(lat, lon);
-    const offRoute = dist != null && dist > ROUTE_DEVIATION_THRESHOLD_M;
-    const warnEl = document.getElementById('driverRouteWarning');
-    if (offRoute){
-      warnEl.hidden = false;
-      warnEl.textContent = '⚠ fora da rota: ~' + fmtDist(dist) + ' do trajeto previsto';
-    } else {
-      warnEl.hidden = true;
-    }
+    const offRoute = updateRouteDeviation(dist, accuracyMeters);
 
     if (isUsing3d() && map3d){
       // pitchAlignment:'viewport' keeps the icon flat/facing the camera regardless of map pitch
@@ -2322,7 +2438,7 @@
         map3dMarker.getElement().innerHTML = busIconHtml(offRoute);
       }
       if (document.getElementById('driverFollowToggle').checked){
-        map3d.easeTo({ center:[lon, lat], bearing: driverBearing, pitch: 62, zoom: Math.max(map3d.getZoom(), 17.5), duration: 500 });
+        map3d.easeTo({ center:[lon, lat], bearing: driverBearing, pitch: 68, zoom: Math.max(map3d.getZoom(), 17.5), duration: 500 });
       }
     } else {
       if (!driverMarker){
@@ -2347,9 +2463,9 @@
     }
     gpsStatus.textContent = 'Obtendo localização...';
     driverWatchId = navigator.geolocation.watchPosition(pos => {
-      const { latitude, longitude } = pos.coords;
+      const { latitude, longitude, accuracy } = pos.coords;
       gpsStatus.innerHTML = 'localização ativa <span class="estimate-note">(atualizado ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) + ')</span>';
-      updateDriverMarker(latitude, longitude);
+      updateDriverMarker(latitude, longitude, accuracy);
     }, err => {
       gpsStatus.textContent = 'Não foi possível obter localização: ' + err.message;
     }, { enableHighAccuracy:true, maximumAge:2000 });
@@ -2397,6 +2513,8 @@
     driverActiveTrip = null;
     driverLastLatLng = null;
     driverBearing = 0;
+    driverOffRouteSince = null;
+    driverOffRouteActive = false;
     driverLayer.clearLayers();
     if (map.hasLayer(driverLayer)) map.removeLayer(driverLayer);
     document.getElementById('driverNavArea').hidden = true;
