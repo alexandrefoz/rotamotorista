@@ -9,6 +9,12 @@
 <link href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;700&family=Public+Sans:wght@400;500;600&family=Overpass+Mono:wght@400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<!-- used only for the driver-mode 3D navigation camera (real pitch/bearing + correctly billboarded
+     vehicle marker, which a CSS-only tilt hack on the Leaflet map couldn't do without distorting the
+     icon) - the passenger map above keeps using plain Leaflet, untouched. Needs a MapTiler API key,
+     pasted by the user into the app itself (see driver mode) - never hardcoded in this shared file. -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" crossorigin="">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js" crossorigin=""></script>
 <style>
   :root{
     --paper:#eef1f4;
@@ -64,13 +70,16 @@
   #stage{position:absolute;inset:0;z-index:1}
   #leafletMap{position:absolute;inset:0;width:100%;height:100%;background:var(--paper)}
   #leafletMap .leaflet-control-attribution{font-family:var(--font-mono);font-size:10px}
-  /* driver-mode "3D" nav view: a CSS-only illusion (no vector-tile engine, no API key) - #stage
-     gets the perspective, #leafletMap gets tilted+rotated by JS on every position update (see
-     updateDriverMarker). Leaflet itself stays untouched/unaware: this is a pure visual transform
-     on top of its normal (flat, correctly-sized) output, so panning/zooming math underneath is
-     unaffected - only the final painted pixels are skewed into a fake perspective. */
-  #stage.driver-3d{perspective:1400px}
-  #leafletMap{transition:transform .35s ease-out}
+  /* driver-mode real 3D nav view (MapLibre GL, needs a user-supplied MapTiler key) - a totally
+     separate map instance/container from the passenger Leaflet map above, shown only while it's
+     active. An earlier CSS-only tilt hack on the Leaflet map (no library, no key) was tried first,
+     but distorted the vehicle icon into the same skew as the tilted ground - a real vector-tile
+     engine handles the camera/billboarding math correctly, which a flat 2D image layer can't. */
+  #driverMap3d{position:absolute;inset:0;width:100%;height:100%;background:var(--paper)}
+  #driverMap3d[hidden]{display:none}
+  #driverMap3d .maplibregl-ctrl-logo, #driverMap3d .maplibregl-ctrl-attrib-inner{font-size:9px}
+  .maptiler-key-field input{font-family:var(--font-mono);font-size:11.5px}
+  .maptiler-key-field .stop-hint a{color:var(--accent-ink)}
   /* free OSM tiles only come in a light palette - this filter fakes a dark map so the app's own
      dark theme doesn't clash with a jarring bright rectangle; a paid dark-tile provider would look
      better but needs an API key, which this app deliberately avoids requiring (see summary) */
@@ -324,6 +333,7 @@
 <body>
 <div id="stage">
   <div id="leafletMap" role="img" aria-label="Mapa com ruas reais da região"></div>
+  <div id="driverMap3d" role="img" aria-label="Navegação 3D do motorista" hidden></div>
   <div class="map-caption">ruas © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · linhas via GTFS</div>
   <div class="map-controls">
     <button id="zoomIn" type="button" aria-label="Aproximar">+</button>
@@ -400,6 +410,12 @@
   <div class="panel-body" id="driverPanelBody" hidden>
     <p class="hint">Escolha a linha e o horário de saída - o trajeto da extensão/variante certa carrega automaticamente.</p>
 
+    <div class="field maptiler-key-field">
+      <label>Chave MapTiler (p/ navegação 3D)</label>
+      <input type="text" id="maptilerKeyInput" placeholder="Cole sua chave aqui">
+      <p class="stop-hint">Grátis em <a href="https://cloud.maptiler.com/account/keys/" target="_blank" rel="noopener">cloud.maptiler.com</a> → Keys → copiar e colar aqui. Fica salva só neste navegador.</p>
+    </div>
+
     <div class="row2">
       <div class="field">
         <label>Linha</label>
@@ -425,7 +441,7 @@
       <p class="stop-hint" id="driverGpsStatus"></p>
       <div id="driverRouteWarning" class="status-msg warn" hidden></div>
       <label class="kml-toggle"><input type="checkbox" id="driverFollowToggle" checked> seguir minha posição no mapa</label>
-      <label class="kml-toggle"><input type="checkbox" id="driver3dToggle" checked> visão inclinada 3D <span class="estimate-note">(experimental)</span></label>
+      <label class="kml-toggle"><input type="checkbox" id="driver3dToggle" checked> navegação 3D <span class="estimate-note">(precisa da chave MapTiler acima)</span></label>
       <button class="btn-secondary" id="driverSimulateBtn" type="button" style="width:100%">Simular percurso (sem GPS real)</button>
       <button class="btn-secondary" id="driverStopBtn" type="button" style="width:100%">Encerrar navegação</button>
     </div>
@@ -1993,6 +2009,39 @@
     return (Math.atan2(y,x)*toDeg + 360) % 360;
   }
 
+  // ---------------- real 3D nav camera (MapLibre GL, driver mode only) ----------------
+  const MAPTILER_KEY_STORAGE = 'foztrans_maptiler_key';
+  const maptilerKeyInput = document.getElementById('maptilerKeyInput');
+  maptilerKeyInput.value = localStorage.getItem(MAPTILER_KEY_STORAGE) || '';
+  maptilerKeyInput.addEventListener('change', () => {
+    try { localStorage.setItem(MAPTILER_KEY_STORAGE, maptilerKeyInput.value.trim()); } catch(e){}
+  });
+  function getMaptilerKey(){ return maptilerKeyInput.value.trim(); }
+
+  let map3d = null, map3dMarker = null, map3dFailed = false;
+  function ensureMap3d(){
+    if (map3d || map3dFailed) return map3d;
+    const key = getMaptilerKey();
+    if (!key) return null;
+    try {
+      map3d = new maplibregl.Map({
+        container: 'driverMap3d',
+        style: 'https://api.maptiler.com/maps/streets-v2/style.json?key=' + encodeURIComponent(key),
+        center: [-54.5877, -25.5163], pitch: 62, bearing: 0, zoom: 16, antialias: true, attributionControl: true
+      });
+      map3d.on('error', (e) => {
+        // a bad/expired key or network issue surfaces here (MapLibre logs to an event, not a thrown
+        // exception) - report it plainly instead of silently sitting on a blank/broken map
+        const gpsStatus = document.getElementById('driverGpsStatus');
+        if (gpsStatus) gpsStatus.textContent = 'Erro no mapa 3D (verifique a chave MapTiler): ' + ((e && e.error && e.error.message) || 'falha desconhecida');
+      });
+    } catch(e){
+      map3dFailed = true;
+      return null;
+    }
+    return map3d;
+  }
+
   const routeShortToIds = new Map();
   Object.keys(routes).forEach(rid => {
     const s = routes[rid].s;
@@ -2103,12 +2152,65 @@
   document.getElementById('driverRouteInput').addEventListener('change', updateDriverPicker);
   document.getElementById('driverTimeInput').addEventListener('change', updateDriverPicker);
 
+  function isUsing3d(){
+    return document.getElementById('driver3dToggle').checked && !!getMaptilerKey() && !map3dFailed;
+  }
+
+  // shows whichever map container matches the current 3D setting - the Leaflet map (passenger's
+  // own map instance, reused for the flat preview/fallback) and the MapLibre one are mutually
+  // exclusive, never both visible, so there's never a question of which is "the real" position
+  function syncMapVisibility(){
+    const using3d = isUsing3d();
+    document.getElementById('leafletMap').hidden = using3d;
+    document.getElementById('driverMap3d').hidden = !using3d;
+    if (using3d){
+      const m3 = ensureMap3d();
+      if (m3) setTimeout(() => m3.resize(), 0); // container just became visible - it had 0 size before
+    }
+  }
+
+  function drawRouteOnMap3d(shapePts, tripId){
+    const m3 = ensureMap3d();
+    if (!m3) return;
+    const geojson = { type:'Feature', geometry:{ type:'LineString', coordinates: shapePts.map(p => [p[1], p[0]]) } };
+    const stopsGeojson = { type:'FeatureCollection', features: (tripStops[tripId]||[]).map(([sid]) => {
+      const s = stops[sid];
+      return s ? { type:'Feature', geometry:{ type:'Point', coordinates:[s.lon, s.lat] }, properties:{ name: s.n } } : null;
+    }).filter(Boolean) };
+    const apply = () => {
+      if (m3.getSource('driver-route')) m3.getSource('driver-route').setData(geojson);
+      else {
+        m3.addSource('driver-route', { type:'geojson', data: geojson });
+        m3.addLayer({ id:'driver-route-line', type:'line', source:'driver-route',
+          paint: { 'line-color': getComputedColor('--accent2'), 'line-width': 6, 'line-opacity': 0.95 } });
+      }
+      if (m3.getSource('driver-stops')) m3.getSource('driver-stops').setData(stopsGeojson);
+      else {
+        m3.addSource('driver-stops', { type:'geojson', data: stopsGeojson });
+        m3.addLayer({ id:'driver-stops-dots', type:'circle', source:'driver-stops',
+          paint: { 'circle-radius':4, 'circle-color': getComputedColor('--accent2'), 'circle-stroke-width':1.5, 'circle-stroke-color': getComputedColor('--surface') } });
+      }
+      const lons = shapePts.map(p=>p[1]), lats = shapePts.map(p=>p[0]);
+      if (lons.length) m3.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]], { padding:48, pitch:62 });
+      // the vehicle marker itself is created lazily by updateDriverMarker on the first real
+      // position fix (GPS or simulation) - not here, so there's one single place that owns it
+    };
+    if (m3.isStyleLoaded()) apply(); else m3.once('load', apply);
+  }
+
+  // resolves a CSS custom property to its actual color value - MapLibre paint properties don't
+  // accept var(...) the way SVG/CSS do, they need a real color string
+  function getComputedColor(varName){
+    return getComputedStyle(document.body).getPropertyValue(varName).trim() || '#7d4fae';
+  }
+
   function startDriverNav(routeShort, cand){
     // switching to a different trip while one is already active (GPS or simulation running) must
     // tear down the old tracking first - otherwise both would fight over driverMarker's position
     if (driverWatchId != null){ navigator.geolocation.clearWatch(driverWatchId); driverWatchId = null; }
     if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
     driverMarker = null;
+    map3dMarker = null;
     driverLastLatLng = null;
     driverBearing = 0;
 
@@ -2120,24 +2222,28 @@
     document.getElementById('driverNavArea').hidden = false;
     document.getElementById('driverRouteWarning').hidden = true;
     document.getElementById('driverGpsStatus').textContent = '';
-    document.getElementById('stage').classList.remove('driver-3d');
-    document.getElementById('leafletMap').style.transform = '';
     renderDriverPicker();
+    syncMapVisibility();
 
-    driverLayer.clearLayers();
-    driverLayer.addTo(map);
     const shapePts = shapes[cand.shapeId] || [];
-    if (shapePts.length){
-      L.polyline(shapePts, { color:'var(--accent2)', weight:5, lineCap:'round', lineJoin:'round', opacity:0.95 }).addTo(driverLayer);
-      map.fitBounds(L.latLngBounds(shapePts), { padding:[36,36] });
+    if (isUsing3d()){
+      drawRouteOnMap3d(shapePts, cand.tripId);
+    } else {
+      driverLayer.clearLayers();
+      driverLayer.addTo(map);
+      if (shapePts.length){
+        L.polyline(shapePts, { color:'var(--accent2)', weight:5, lineCap:'round', lineJoin:'round', opacity:0.95 }).addTo(driverLayer);
+        map.fitBounds(L.latLngBounds(shapePts), { padding:[36,36] });
+      }
+      (tripStops[cand.tripId] || []).forEach(([sid]) => {
+        const s = stops[sid];
+        if (!s) return;
+        L.circleMarker([s.lat, s.lon], { radius:4, weight:1.5, color:'var(--surface)', fillColor:'var(--accent2)', fillOpacity:1 })
+          .bindTooltip(escapeHtml(s.n), { direction:'top' })
+          .addTo(driverLayer);
+      });
+      if (!getMaptilerKey()) document.getElementById('driverGpsStatus').innerHTML = 'sem chave MapTiler - usando mapa 2D <span class="estimate-note">(cole a chave acima para navegação 3D)</span>';
     }
-    (tripStops[cand.tripId] || []).forEach(([sid]) => {
-      const s = stops[sid];
-      if (!s) return;
-      L.circleMarker([s.lat, s.lon], { radius:4, weight:1.5, color:'var(--surface)', fillColor:'var(--accent2)', fillOpacity:1 })
-        .bindTooltip(escapeHtml(s.n), { direction:'top' })
-        .addTo(driverLayer);
-    });
 
     startRealGps();
   }
@@ -2162,9 +2268,10 @@
   // simple top-down bus glyph (not an emoji, to match this app's existing icon style elsewhere) -
   // oriented pointing "up" by default, which is correct exactly because the map itself rotates to
   // keep the direction of travel pointing up (see driverBearing) - the icon never rotates on its own
+  const BUS_ICON_PX = 52; // reference nav apps (Uber/Google) use a large, hard-to-miss vehicle glyph
   function busIconHtml(offRoute){
     const color = offRoute ? 'var(--dest)' : 'var(--accent)';
-    return '<svg width="30" height="30" viewBox="0 0 30 30">' +
+    return '<svg width="' + BUS_ICON_PX + '" height="' + BUS_ICON_PX + '" viewBox="0 0 30 30" style="filter:drop-shadow(0 2px 4px rgba(0,0,0,.45))">' +
       '<rect x="9" y="4" width="12" height="22" rx="4" fill="' + color + '" stroke="var(--surface)" stroke-width="2.2"/>' +
       '<rect x="11.5" y="7.5" width="7" height="4.5" rx="1" fill="var(--surface)" opacity="0.9"/>' +
       '<rect x="11" y="14" width="2.6" height="8" rx="0.8" fill="var(--surface)" opacity="0.55"/>' +
@@ -2172,7 +2279,7 @@
     '</svg>';
   }
   function driverMarkerIcon(offRoute){
-    return L.divIcon({ className:'bus-icon', html:busIconHtml(offRoute), iconSize:[30,30], iconAnchor:[15,15] });
+    return L.divIcon({ className:'bus-icon', html:busIconHtml(offRoute), iconSize:[BUS_ICON_PX,BUS_ICON_PX], iconAnchor:[BUS_ICON_PX/2,BUS_ICON_PX/2] });
   }
 
   function setDriverMarkerIcon(offRoute){
@@ -2181,11 +2288,6 @@
   }
 
   function updateDriverMarker(lat, lon){
-    if (!driverMarker){
-      driverMarker = L.marker([lat, lon], { icon: driverMarkerIcon(false), zIndexOffset: 1000 }).addTo(driverLayer);
-    } else {
-      driverMarker.setLatLng([lat, lon]);
-    }
     // heading only makes sense once there's a previous fix to compare against - the very first
     // update of a session keeps whatever bearing (0/north) was last set, rather than guessing
     if (driverLastLatLng){
@@ -2193,33 +2295,47 @@
       if (moved > 3) driverBearing = bearingDeg(driverLastLatLng.lat, driverLastLatLng.lon, lat, lon); // ignore GPS jitter under ~3m
     }
     driverLastLatLng = { lat, lon };
-    const mapEl = document.getElementById('leafletMap');
-    if (document.getElementById('driver3dToggle').checked){
-      // a gentler pitch + a longer perspective distance reads as "camera far away, slight tilt"
-      // instead of "map falling backward" - the sharp angle + short perspective was what made the
-      // first version look obviously fake. Tighter zoom (below) also matters as much as the angle:
-      // tiles rendered at the same zoom used for the whole-route overview look soft/blurry once
-      // tilted, which reads as "cheap" regardless of the transform numbers.
-      document.getElementById('stage').classList.add('driver-3d');
-      mapEl.style.transform = 'rotateX(38deg) rotate(' + (-driverBearing) + 'deg) scale(1.25)';
-    } else {
-      document.getElementById('stage').classList.remove('driver-3d');
-      mapEl.style.transform = '';
-    }
-    if (document.getElementById('driverFollowToggle').checked){
-      // close, street-level zoom (not the whole-route overview zoom from startDriverNav) - real
-      // nav apps always frame just the vehicle's immediate surroundings, never the full route
-      map.setView([lat, lon], Math.max(map.getZoom(), 17), { animate:true });
-    }
+
     const dist = driverDistanceToRoute(lat, lon);
-    const warnEl = document.getElementById('driverRouteWarning');
     const offRoute = dist != null && dist > ROUTE_DEVIATION_THRESHOLD_M;
-    setDriverMarkerIcon(offRoute);
+    const warnEl = document.getElementById('driverRouteWarning');
     if (offRoute){
       warnEl.hidden = false;
       warnEl.textContent = '⚠ fora da rota: ~' + fmtDist(dist) + ' do trajeto previsto';
     } else {
       warnEl.hidden = true;
+    }
+
+    if (isUsing3d() && map3d){
+      // pitchAlignment:'viewport' keeps the icon flat/facing the camera regardless of map pitch
+      // (this is exactly what a CSS-only tilt on a 2D image layer can't do - the icon there was
+      // baked into the same tilted plane as the roads, so it got skewed along with them). MapLibre
+      // handles the 3D projection math for markers correctly, which is the whole reason for this.
+      if (!map3dMarker){
+        const el = document.createElement('div');
+        el.innerHTML = busIconHtml(offRoute);
+        map3dMarker = new maplibregl.Marker({ element: el, pitchAlignment:'viewport', rotationAlignment:'map', rotation: driverBearing })
+          .setLngLat([lon, lat]).addTo(map3d);
+      } else {
+        map3dMarker.setLngLat([lon, lat]);
+        map3dMarker.setRotation(driverBearing);
+        map3dMarker.getElement().innerHTML = busIconHtml(offRoute);
+      }
+      if (document.getElementById('driverFollowToggle').checked){
+        map3d.easeTo({ center:[lon, lat], bearing: driverBearing, pitch: 62, zoom: Math.max(map3d.getZoom(), 17.5), duration: 500 });
+      }
+    } else {
+      if (!driverMarker){
+        driverMarker = L.marker([lat, lon], { icon: driverMarkerIcon(offRoute), zIndexOffset: 1000 }).addTo(driverLayer);
+      } else {
+        driverMarker.setLatLng([lat, lon]);
+        setDriverMarkerIcon(offRoute);
+      }
+      if (document.getElementById('driverFollowToggle').checked){
+        // close, street-level zoom (not the whole-route overview zoom from startDriverNav) - real
+        // nav apps always frame just the vehicle's immediate surroundings, never the full route
+        map.setView([lat, lon], Math.max(map.getZoom(), 17), { animate:true });
+      }
     }
   }
 
@@ -2277,6 +2393,7 @@
     if (driverWatchId != null){ navigator.geolocation.clearWatch(driverWatchId); driverWatchId = null; }
     if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
     driverMarker = null;
+    if (map3dMarker){ map3dMarker.remove(); map3dMarker = null; }
     driverActiveTrip = null;
     driverLastLatLng = null;
     driverBearing = 0;
@@ -2285,20 +2402,31 @@
     document.getElementById('driverNavArea').hidden = true;
     document.getElementById('driverGpsStatus').textContent = '';
     document.getElementById('driverRouteWarning').hidden = true;
-    document.getElementById('stage').classList.remove('driver-3d');
-    document.getElementById('leafletMap').style.transform = '';
+    document.getElementById('leafletMap').hidden = false;
+    document.getElementById('driverMap3d').hidden = true;
     renderDriverPicker(); // list stays up (same route+horário) so picking another trip is one click
   }
   document.getElementById('driverStopBtn').addEventListener('click', stopDriverNav);
-  document.getElementById('driver3dToggle').addEventListener('change', (e) => {
-    const mapEl = document.getElementById('leafletMap');
-    if (!e.target.checked){
-      document.getElementById('stage').classList.remove('driver-3d');
-      mapEl.style.transform = '';
-    } else if (driverMarker){
-      document.getElementById('stage').classList.add('driver-3d');
-      mapEl.style.transform = 'rotateX(38deg) rotate(' + (-driverBearing) + 'deg) scale(1.25)';
+  document.getElementById('driver3dToggle').addEventListener('change', () => {
+    if (!driverActiveTrip) return;
+    // switching engines mid-navigation: redraw the route on whichever map just became visible and
+    // let the marker be recreated fresh there by the next position update (real GPS keeps running
+    // via its own watch; only its on-screen representation needs to move to the other map)
+    driverMarker = null;
+    if (map3dMarker){ map3dMarker.remove(); map3dMarker = null; }
+    syncMapVisibility();
+    const shapePts = shapes[driverActiveTrip.shapeId] || [];
+    if (isUsing3d()){
+      drawRouteOnMap3d(shapePts, driverActiveTrip.tripId);
+    } else {
+      driverLayer.clearLayers();
+      driverLayer.addTo(map);
+      if (shapePts.length){
+        L.polyline(shapePts, { color:'var(--accent2)', weight:5, lineCap:'round', lineJoin:'round', opacity:0.95 }).addTo(driverLayer);
+        map.fitBounds(L.latLngBounds(shapePts), { padding:[36,36] });
+      }
     }
+    if (driverLastLatLng) updateDriverMarker(driverLastLatLng.lat, driverLastLatLng.lon);
   });
 })();
 </script>
