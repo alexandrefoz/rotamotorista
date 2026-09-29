@@ -64,6 +64,13 @@
   #stage{position:absolute;inset:0;z-index:1}
   #leafletMap{position:absolute;inset:0;width:100%;height:100%;background:var(--paper)}
   #leafletMap .leaflet-control-attribution{font-family:var(--font-mono);font-size:10px}
+  /* driver-mode "3D" nav view: a CSS-only illusion (no vector-tile engine, no API key) - #stage
+     gets the perspective, #leafletMap gets tilted+rotated by JS on every position update (see
+     updateDriverMarker). Leaflet itself stays untouched/unaware: this is a pure visual transform
+     on top of its normal (flat, correctly-sized) output, so panning/zooming math underneath is
+     unaffected - only the final painted pixels are skewed into a fake perspective. */
+  #stage.driver-3d{perspective:900px}
+  #leafletMap{transition:transform .35s ease-out}
   /* free OSM tiles only come in a light palette - this filter fakes a dark map so the app's own
      dark theme doesn't clash with a jarring bright rectangle; a paid dark-tile provider would look
      better but needs an API key, which this app deliberately avoids requiring (see summary) */
@@ -149,6 +156,9 @@
   }
   .panel-head p{margin:0;font-size:12px;color:var(--ink-dim);line-height:1.45}
   .panel-body{padding:14px 18px 18px;display:flex;flex-direction:column;gap:12px}
+  /* [hidden] is equal specificity to the class rule above and loses to it in cascade order
+     without this - passenger and driver panel bodies were both rendering stacked at the same time */
+  .panel-body[hidden]{display:none}
 
   .hint{font-size:11px;color:var(--ink-dim);line-height:1.5;margin:0}
   .stop-hint{font-size:10.5px;color:var(--ink-dim);margin:5px 2px 0;min-height:13px}
@@ -198,6 +208,7 @@
   .kml-import-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .kml-import .btn-secondary{padding:7px 11px;font-size:11.5px}
   .kml-toggle{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--ink-dim);cursor:pointer}
+  .kml-toggle[hidden]{display:none}
   .kml-toggle input{margin:0}
 
   .status-msg{
@@ -275,6 +286,8 @@
   }
   .trip-option:hover{border-color:var(--accent)}
   .trip-option.suggested{border-color:var(--accent);background:color-mix(in srgb, var(--accent) 8%, var(--surface))}
+  .trip-option.active{border-color:var(--accent2);background:color-mix(in srgb, var(--accent2) 12%, var(--surface))}
+  .trip-option.active .trip-option-badge{background:color-mix(in srgb, var(--accent2) 20%, transparent);color:var(--accent2-ink)}
   .trip-option-headsign{font-size:12px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .trip-option-time{font-family:var(--font-mono);font-size:12px;font-variant-numeric:tabular-nums;color:var(--ink-dim)}
   .trip-option-badge{
@@ -288,6 +301,7 @@
   .driver-active-top{display:flex;align-items:center;gap:8px}
   .driver-active-headsign{font-size:12.5px;font-weight:600;font-family:var(--font-display)}
   #driverNavArea{display:flex;flex-direction:column;gap:8px}
+  #driverNavArea[hidden]{display:none}
 
   ::-webkit-scrollbar{width:8px}
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px}
@@ -411,6 +425,7 @@
       <p class="stop-hint" id="driverGpsStatus"></p>
       <div id="driverRouteWarning" class="status-msg warn" hidden></div>
       <label class="kml-toggle"><input type="checkbox" id="driverFollowToggle" checked> seguir minha posição no mapa</label>
+      <label class="kml-toggle"><input type="checkbox" id="driver3dToggle" checked> visão inclinada 3D <span class="estimate-note">(experimental)</span></label>
       <button class="btn-secondary" id="driverSimulateBtn" type="button" style="width:100%">Simular percurso (sem GPS real)</button>
       <button class="btn-secondary" id="driverStopBtn" type="button" style="width:100%">Encerrar navegação</button>
     </div>
@@ -1968,6 +1983,15 @@
   let driverSimTimer = null;
   let driverMarker = null;
   let driverActiveTrip = null;
+  let driverLastLatLng = null;
+  let driverBearing = 0;
+
+  function bearingDeg(lat1, lon1, lat2, lon2){
+    const toRad = Math.PI/180, toDeg = 180/Math.PI;
+    const y = Math.sin((lon2-lon1)*toRad) * Math.cos(lat2*toRad);
+    const x = Math.cos(lat1*toRad)*Math.sin(lat2*toRad) - Math.sin(lat1*toRad)*Math.cos(lat2*toRad)*Math.cos((lon2-lon1)*toRad);
+    return (Math.atan2(y,x)*toDeg + 360) % 360;
+  }
 
   const routeShortToIds = new Map();
   Object.keys(routes).forEach(rid => {
@@ -2024,53 +2048,81 @@
     return out.slice(0, 6);
   }
 
+  // kept so the list can be re-rendered (to update which item is highlighted "active") every time
+  // a trip is picked, instead of disappearing the moment one is chosen - browsing between several
+  // trips of the same line/time only needs clicking a different row, never re-entering line+horário
+  let driverRouteShort = null, driverCandList = [];
+
+  function renderDriverPicker(){
+    const picker = document.getElementById('driverTripPicker');
+    picker.innerHTML = '';
+    if (!driverCandList.length) return;
+    const route = routes[driverCandList[0].routeId];
+    driverCandList.forEach((c, i) => {
+      const el = document.createElement('div');
+      const isActive = driverActiveTrip && driverActiveTrip.tripId === c.tripId;
+      el.className = 'trip-option' + (isActive ? ' active' : (i===0 && !driverActiveTrip ? ' suggested' : ''));
+      el.innerHTML =
+        '<span class="trip-option-headsign">' + escapeHtml(c.headsign || (route?route.l:'')) +
+          (isActive ? '<span class="trip-option-badge">em navegação</span>' : (i===0 && !driverActiveTrip ? '<span class="trip-option-badge">mais próxima</span>' : '')) +
+        '</span>' +
+        '<span class="trip-option-time">' + c.depTime.slice(0,5) + '</span>';
+      el.addEventListener('click', () => startDriverNav(driverRouteShort, c));
+      picker.appendChild(el);
+    });
+  }
+
   function updateDriverPicker(){
     const val = document.getElementById('driverRouteInput').value.trim();
     const timeVal = document.getElementById('driverTimeInput').value;
-    const picker = document.getElementById('driverTripPicker');
-    picker.innerHTML = '';
+    driverRouteShort = val;
     if (!val || !routeShortToIds.has(val)){
-      if (val) picker.innerHTML = '<p class="stop-hint">Linha não encontrada.</p>';
+      driverCandList = [];
+      document.getElementById('driverTripPicker').innerHTML = val ? '<p class="stop-hint">Linha não encontrada.</p>' : '';
       return;
     }
     if (!timeVal) return;
-    const cands = driverCandidateTrips(val, timeToMinutes(timeVal+':00'));
-    if (!cands.length){
-      picker.innerHTML = '<p class="stop-hint">Nenhuma viagem ativa hoje para essa linha.</p>';
+    driverCandList = driverCandidateTrips(val, timeToMinutes(timeVal+':00'));
+    if (!driverCandList.length){
+      document.getElementById('driverTripPicker').innerHTML = '<p class="stop-hint">Nenhuma viagem ativa hoje para essa linha.</p>';
       return;
     }
     // auto-loads only when there's a single unambiguous best match (an exact time hit with no
     // tie, or just one candidate at all) - matching "só entra na linha e no horário e o trajeto já
     // carrega". A tie (e.g. IDA and VOLTA both scheduled for the same minute) still needs the
-    // driver to pick the right direction, so it falls through to the picker list instead.
-    const exactTies = cands.filter(c => c.diff === 0).length;
-    if (cands.length === 1 || (cands[0].diff === 0 && exactTies === 1)){
-      startDriverNav(val, cands[0]);
-      return;
+    // driver to pick the right direction, so it falls through to the picker list instead. Either
+    // way the full list stays visible afterward (see renderDriverPicker), so switching to a
+    // different departure is always just a click, never a re-entry of linha+horário.
+    const exactTies = driverCandList.filter(c => c.diff === 0).length;
+    if (driverCandList.length === 1 || (driverCandList[0].diff === 0 && exactTies === 1)){
+      startDriverNav(val, driverCandList[0]);
+    } else {
+      renderDriverPicker();
     }
-    const route = routes[cands[0].routeId];
-    cands.forEach((c, i) => {
-      const el = document.createElement('div');
-      el.className = 'trip-option' + (i===0 ? ' suggested' : '');
-      el.innerHTML =
-        '<span class="trip-option-headsign">' + escapeHtml(c.headsign || (route?route.l:'')) + (i===0 ? '<span class="trip-option-badge">mais próxima</span>' : '') + '</span>' +
-        '<span class="trip-option-time">' + c.depTime.slice(0,5) + '</span>';
-      el.addEventListener('click', () => startDriverNav(val, c));
-      picker.appendChild(el);
-    });
   }
   document.getElementById('driverRouteInput').addEventListener('change', updateDriverPicker);
   document.getElementById('driverTimeInput').addEventListener('change', updateDriverPicker);
 
   function startDriverNav(routeShort, cand){
+    // switching to a different trip while one is already active (GPS or simulation running) must
+    // tear down the old tracking first - otherwise both would fight over driverMarker's position
+    if (driverWatchId != null){ navigator.geolocation.clearWatch(driverWatchId); driverWatchId = null; }
+    if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
+    driverMarker = null;
+    driverLastLatLng = null;
+    driverBearing = 0;
+
     driverActiveTrip = cand;
     const route = routes[cand.routeId];
     document.getElementById('driverActiveRoute').textContent = routeShort;
     document.getElementById('driverActiveHeadsign').textContent = cand.headsign || (route?route.l:'');
     document.getElementById('driverActiveMeta').innerHTML = 'partida programada: <b>' + cand.depTime.slice(0,5) + '</b>';
-    document.getElementById('driverTripPicker').innerHTML = '';
     document.getElementById('driverNavArea').hidden = false;
     document.getElementById('driverRouteWarning').hidden = true;
+    document.getElementById('driverGpsStatus').textContent = '';
+    document.getElementById('stage').classList.remove('driver-3d');
+    document.getElementById('leafletMap').style.transform = '';
+    renderDriverPicker();
 
     driverLayer.clearLayers();
     driverLayer.addTo(map);
@@ -2124,6 +2176,21 @@
       }).addTo(driverLayer);
     } else {
       driverMarker.setLatLng([lat, lon]);
+    }
+    // heading only makes sense once there's a previous fix to compare against - the very first
+    // update of a session keeps whatever bearing (0/north) was last set, rather than guessing
+    if (driverLastLatLng){
+      const moved = haversine(driverLastLatLng.lat, driverLastLatLng.lon, lat, lon);
+      if (moved > 3) driverBearing = bearingDeg(driverLastLatLng.lat, driverLastLatLng.lon, lat, lon); // ignore GPS jitter under ~3m
+    }
+    driverLastLatLng = { lat, lon };
+    const mapEl = document.getElementById('leafletMap');
+    if (document.getElementById('driver3dToggle').checked){
+      document.getElementById('stage').classList.add('driver-3d');
+      mapEl.style.transform = 'rotateX(55deg) rotate(' + (-driverBearing) + 'deg) scale(1.5)';
+    } else {
+      document.getElementById('stage').classList.remove('driver-3d');
+      mapEl.style.transform = '';
     }
     if (document.getElementById('driverFollowToggle').checked){
       map.panTo([lat, lon]);
@@ -2195,13 +2262,28 @@
     if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
     driverMarker = null;
     driverActiveTrip = null;
+    driverLastLatLng = null;
+    driverBearing = 0;
     driverLayer.clearLayers();
     if (map.hasLayer(driverLayer)) map.removeLayer(driverLayer);
     document.getElementById('driverNavArea').hidden = true;
     document.getElementById('driverGpsStatus').textContent = '';
     document.getElementById('driverRouteWarning').hidden = true;
+    document.getElementById('stage').classList.remove('driver-3d');
+    document.getElementById('leafletMap').style.transform = '';
+    renderDriverPicker(); // list stays up (same route+horário) so picking another trip is one click
   }
   document.getElementById('driverStopBtn').addEventListener('click', stopDriverNav);
+  document.getElementById('driver3dToggle').addEventListener('change', (e) => {
+    const mapEl = document.getElementById('leafletMap');
+    if (!e.target.checked){
+      document.getElementById('stage').classList.remove('driver-3d');
+      mapEl.style.transform = '';
+    } else if (driverMarker){
+      document.getElementById('stage').classList.add('driver-3d');
+      mapEl.style.transform = 'rotateX(55deg) rotate(' + (-driverBearing) + 'deg) scale(1.5)';
+    }
+  });
 })();
 </script>
 </body>
