@@ -69,7 +69,7 @@
      updateDriverMarker). Leaflet itself stays untouched/unaware: this is a pure visual transform
      on top of its normal (flat, correctly-sized) output, so panning/zooming math underneath is
      unaffected - only the final painted pixels are skewed into a fake perspective. */
-  #stage.driver-3d{perspective:900px}
+  #stage.driver-3d{perspective:1400px}
   #leafletMap{transition:transform .35s ease-out}
   /* free OSM tiles only come in a light palette - this filter fakes a dark map so the app's own
      dark theme doesn't clash with a jarring bright rectangle; a paid dark-tile provider would look
@@ -2159,21 +2159,30 @@
     return best;
   }
 
+  // simple top-down bus glyph (not an emoji, to match this app's existing icon style elsewhere) -
+  // oriented pointing "up" by default, which is correct exactly because the map itself rotates to
+  // keep the direction of travel pointing up (see driverBearing) - the icon never rotates on its own
+  function busIconHtml(offRoute){
+    const color = offRoute ? 'var(--dest)' : 'var(--accent)';
+    return '<svg width="30" height="30" viewBox="0 0 30 30">' +
+      '<rect x="9" y="4" width="12" height="22" rx="4" fill="' + color + '" stroke="var(--surface)" stroke-width="2.2"/>' +
+      '<rect x="11.5" y="7.5" width="7" height="4.5" rx="1" fill="var(--surface)" opacity="0.9"/>' +
+      '<rect x="11" y="14" width="2.6" height="8" rx="0.8" fill="var(--surface)" opacity="0.55"/>' +
+      '<rect x="16.4" y="14" width="2.6" height="8" rx="0.8" fill="var(--surface)" opacity="0.55"/>' +
+    '</svg>';
+  }
+  function driverMarkerIcon(offRoute){
+    return L.divIcon({ className:'bus-icon', html:busIconHtml(offRoute), iconSize:[30,30], iconAnchor:[15,15] });
+  }
+
   function setDriverMarkerIcon(offRoute){
     if (!driverMarker) return;
-    driverMarker.setIcon(L.divIcon({
-      className:'pin-icon',
-      html:'<div class="pin-dot" style="background:var(' + (offRoute?'--dest':'--accent2') + ')"><span>▲</span></div>',
-      iconSize:[22,22], iconAnchor:[11,11]
-    }));
+    driverMarker.setIcon(driverMarkerIcon(offRoute));
   }
 
   function updateDriverMarker(lat, lon){
     if (!driverMarker){
-      driverMarker = L.marker([lat, lon], {
-        icon: L.divIcon({ className:'pin-icon', html:'<div class="pin-dot" style="background:var(--accent2)"><span>▲</span></div>', iconSize:[22,22], iconAnchor:[11,11] }),
-        zIndexOffset: 1000
-      }).addTo(driverLayer);
+      driverMarker = L.marker([lat, lon], { icon: driverMarkerIcon(false), zIndexOffset: 1000 }).addTo(driverLayer);
     } else {
       driverMarker.setLatLng([lat, lon]);
     }
@@ -2186,14 +2195,21 @@
     driverLastLatLng = { lat, lon };
     const mapEl = document.getElementById('leafletMap');
     if (document.getElementById('driver3dToggle').checked){
+      // a gentler pitch + a longer perspective distance reads as "camera far away, slight tilt"
+      // instead of "map falling backward" - the sharp angle + short perspective was what made the
+      // first version look obviously fake. Tighter zoom (below) also matters as much as the angle:
+      // tiles rendered at the same zoom used for the whole-route overview look soft/blurry once
+      // tilted, which reads as "cheap" regardless of the transform numbers.
       document.getElementById('stage').classList.add('driver-3d');
-      mapEl.style.transform = 'rotateX(55deg) rotate(' + (-driverBearing) + 'deg) scale(1.5)';
+      mapEl.style.transform = 'rotateX(38deg) rotate(' + (-driverBearing) + 'deg) scale(1.25)';
     } else {
       document.getElementById('stage').classList.remove('driver-3d');
       mapEl.style.transform = '';
     }
     if (document.getElementById('driverFollowToggle').checked){
-      map.panTo([lat, lon]);
+      // close, street-level zoom (not the whole-route overview zoom from startDriverNav) - real
+      // nav apps always frame just the vehicle's immediate surroundings, never the full route
+      map.setView([lat, lon], Math.max(map.getZoom(), 17), { animate:true });
     }
     const dist = driverDistanceToRoute(lat, lon);
     const warnEl = document.getElementById('driverRouteWarning');
@@ -2281,7 +2297,7 @@
       mapEl.style.transform = '';
     } else if (driverMarker){
       document.getElementById('stage').classList.add('driver-3d');
-      mapEl.style.transform = 'rotateX(55deg) rotate(' + (-driverBearing) + 'deg) scale(1.5)';
+      mapEl.style.transform = 'rotateX(38deg) rotate(' + (-driverBearing) + 'deg) scale(1.25)';
     }
   });
 })();
