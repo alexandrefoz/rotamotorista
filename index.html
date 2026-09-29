@@ -409,7 +409,9 @@
         <p class="stop-hint" id="driverActiveMeta"></p>
       </div>
       <p class="stop-hint" id="driverGpsStatus"></p>
+      <div id="driverRouteWarning" class="status-msg warn" hidden></div>
       <label class="kml-toggle"><input type="checkbox" id="driverFollowToggle" checked> seguir minha posição no mapa</label>
+      <button class="btn-secondary" id="driverSimulateBtn" type="button" style="width:100%">Simular percurso (sem GPS real)</button>
       <button class="btn-secondary" id="driverStopBtn" type="button" style="width:100%">Encerrar navegação</button>
     </div>
   </div>
@@ -1963,6 +1965,7 @@
   // correct path never depends on a turn-by-turn app re-optimizing a route on its own.
   const driverLayer = L.layerGroup();
   let driverWatchId = null;
+  let driverSimTimer = null;
   let driverMarker = null;
   let driverActiveTrip = null;
 
@@ -2067,6 +2070,7 @@
     document.getElementById('driverActiveMeta').innerHTML = 'partida programada: <b>' + cand.depTime.slice(0,5) + '</b>';
     document.getElementById('driverTripPicker').innerHTML = '';
     document.getElementById('driverNavArea').hidden = false;
+    document.getElementById('driverRouteWarning').hidden = true;
 
     driverLayer.clearLayers();
     driverLayer.addTo(map);
@@ -2083,6 +2087,60 @@
         .addTo(driverLayer);
     });
 
+    startRealGps();
+  }
+
+  // "um raio considerável" - a driver a couple dozen meters off a shape's straight-line simplification
+  // is normal (lane position, GPS noise, a real curve the shape simplified), so the threshold is set
+  // well above that: only a genuine wrong-turn-scale deviation should trigger the warning
+  const ROUTE_DEVIATION_THRESHOLD_M = 150;
+
+  function driverDistanceToRoute(lat, lon){
+    if (!driverActiveTrip) return null;
+    const pts = shapes[driverActiveTrip.shapeId];
+    if (!pts || !pts.length) return null;
+    let best = Infinity;
+    for (let i=0;i<pts.length;i++){
+      const d = haversine(lat, lon, pts[i][0], pts[i][1]);
+      if (d<best) best = d;
+    }
+    return best;
+  }
+
+  function setDriverMarkerIcon(offRoute){
+    if (!driverMarker) return;
+    driverMarker.setIcon(L.divIcon({
+      className:'pin-icon',
+      html:'<div class="pin-dot" style="background:var(' + (offRoute?'--dest':'--accent2') + ')"><span>▲</span></div>',
+      iconSize:[22,22], iconAnchor:[11,11]
+    }));
+  }
+
+  function updateDriverMarker(lat, lon){
+    if (!driverMarker){
+      driverMarker = L.marker([lat, lon], {
+        icon: L.divIcon({ className:'pin-icon', html:'<div class="pin-dot" style="background:var(--accent2)"><span>▲</span></div>', iconSize:[22,22], iconAnchor:[11,11] }),
+        zIndexOffset: 1000
+      }).addTo(driverLayer);
+    } else {
+      driverMarker.setLatLng([lat, lon]);
+    }
+    if (document.getElementById('driverFollowToggle').checked){
+      map.panTo([lat, lon]);
+    }
+    const dist = driverDistanceToRoute(lat, lon);
+    const warnEl = document.getElementById('driverRouteWarning');
+    const offRoute = dist != null && dist > ROUTE_DEVIATION_THRESHOLD_M;
+    setDriverMarkerIcon(offRoute);
+    if (offRoute){
+      warnEl.hidden = false;
+      warnEl.textContent = '⚠ fora da rota: ~' + fmtDist(dist) + ' do trajeto previsto';
+    } else {
+      warnEl.hidden = true;
+    }
+  }
+
+  function startRealGps(){
     const gpsStatus = document.getElementById('driverGpsStatus');
     if (!navigator.geolocation){
       gpsStatus.textContent = 'Geolocalização não suportada neste navegador.';
@@ -2092,30 +2150,56 @@
     driverWatchId = navigator.geolocation.watchPosition(pos => {
       const { latitude, longitude } = pos.coords;
       gpsStatus.innerHTML = 'localização ativa <span class="estimate-note">(atualizado ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) + ')</span>';
-      if (!driverMarker){
-        driverMarker = L.marker([latitude, longitude], {
-          icon: L.divIcon({ className:'pin-icon', html:'<div class="pin-dot" style="background:var(--accent2)"><span>▲</span></div>', iconSize:[22,22], iconAnchor:[11,11] }),
-          zIndexOffset: 1000
-        }).addTo(driverLayer);
-      } else {
-        driverMarker.setLatLng([latitude, longitude]);
-      }
-      if (document.getElementById('driverFollowToggle').checked){
-        map.panTo([latitude, longitude]);
-      }
+      updateDriverMarker(latitude, longitude);
     }, err => {
       gpsStatus.textContent = 'Não foi possível obter localização: ' + err.message;
     }, { enableHighAccuracy:true, maximumAge:2000 });
   }
 
+  // animates the driver marker along the trip's own real shape, at a rough bus-speed pace - lets
+  // anyone preview how live tracking will look without physically being on the route, which is
+  // also why real GPS wouldn't show anything useful in the same spot for a test done elsewhere
+  const SIM_STEP_MS = 400, SIM_SPEED_MPS = 8; // ~29 km/h, reasonable urban bus pace
+  function startSimulation(){
+    if (driverWatchId != null){ navigator.geolocation.clearWatch(driverWatchId); driverWatchId = null; }
+    if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
+    const shapePts = driverActiveTrip ? (shapes[driverActiveTrip.shapeId] || []) : [];
+    if (shapePts.length < 2) return;
+    driverMarker = null;
+    const gpsStatus = document.getElementById('driverGpsStatus');
+    let idx = 0;
+    gpsStatus.textContent = 'simulando percurso...';
+    updateDriverMarker(shapePts[0][0], shapePts[0][1]);
+    driverSimTimer = setInterval(() => {
+      if (idx >= shapePts.length - 1){
+        clearInterval(driverSimTimer); driverSimTimer = null;
+        gpsStatus.innerHTML = 'simulação concluída <span class="estimate-note">(fim do trajeto)</span>';
+        return;
+      }
+      // advance roughly SIM_SPEED_MPS*step worth of distance per tick, not just one point per
+      // tick - shape points aren't evenly spaced, so a fixed point-per-tick pace would look jerky
+      const stepM = SIM_SPEED_MPS * (SIM_STEP_MS/1000);
+      let travelled = 0;
+      while (idx < shapePts.length-1 && travelled < stepM){
+        travelled += haversine(shapePts[idx][0], shapePts[idx][1], shapePts[idx+1][0], shapePts[idx+1][1]);
+        idx++;
+      }
+      updateDriverMarker(shapePts[idx][0], shapePts[idx][1]);
+      gpsStatus.innerHTML = 'simulando percurso <span class="estimate-note">(' + Math.round(idx/(shapePts.length-1)*100) + '% do trajeto)</span>';
+    }, SIM_STEP_MS);
+  }
+  document.getElementById('driverSimulateBtn').addEventListener('click', startSimulation);
+
   function stopDriverNav(){
     if (driverWatchId != null){ navigator.geolocation.clearWatch(driverWatchId); driverWatchId = null; }
+    if (driverSimTimer != null){ clearInterval(driverSimTimer); driverSimTimer = null; }
     driverMarker = null;
     driverActiveTrip = null;
     driverLayer.clearLayers();
     if (map.hasLayer(driverLayer)) map.removeLayer(driverLayer);
     document.getElementById('driverNavArea').hidden = true;
     document.getElementById('driverGpsStatus').textContent = '';
+    document.getElementById('driverRouteWarning').hidden = true;
   }
   document.getElementById('driverStopBtn').addEventListener('click', stopDriverNav);
 })();
